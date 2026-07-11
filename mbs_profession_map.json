@@ -1,0 +1,46 @@
+{
+  "_note": "FIRST-PASS group -> profession scoping for mental-health MBS items. NOT authoritative. Eligibility must be verified against the Better Access rules and the MBS category/group/item notes before production use. 'mixed' groups hold items for several provider types; mbs_professions.py refines those per item from the descriptor.",
+  "schedule_version": "2026-07-01",
+  "groups": [
+    {
+      "cat": "1", "grp": "A8", "mixed": false,
+      "professions": ["psychiatrist"],
+      "label": "Consultant physician (psychiatry) attendances"
+    },
+    {
+      "cat": "1", "grp": "A20", "mixed": false,
+      "professions": ["general_practitioner"],
+      "label": "GP mental health treatment plan items"
+    },
+    {
+      "cat": "1", "grp": "A36", "mixed": false,
+      "professions": ["general_practitioner"],
+      "label": "GP eating disorder treatment & management plan items"
+    },
+    {
+      "cat": "1", "grp": "A40", "mixed": true,
+      "professions": ["general_practitioner", "psychiatrist", "consultant_physician", "specialist"],
+      "label": "Telehealth (video/phone) attendances - mixed medical providers"
+    },
+    {
+      "cat": "8", "grp": "M6", "mixed": false,
+      "professions": ["clinical_psychologist"],
+      "label": "Psychological therapy by clinical psychologist (Better Access)"
+    },
+    {
+      "cat": "8", "grp": "M7", "mixed": true,
+      "professions": ["registered_psychologist", "fps_allied_health"],
+      "label": "Focussed psychological strategies by psychologist / eligible allied health"
+    },
+    {
+      "cat": "8", "grp": "M16", "mixed": true,
+      "professions": ["dietitian", "clinical_psychologist", "registered_psychologist", "fps_allied_health"],
+      "label": "Eating disorder services - dietetics and psychological therapy"
+    },
+    {
+      "cat": "8", "grp": "M18", "mixed": true,
+      "professions": ["clinical_psychologist", "registered_psychologist", "dietitian", "fps_allied_health"],
+      "label": "Telehealth (video/phone) allied mental health & eating disorder services"
+    }
+  ]
+}

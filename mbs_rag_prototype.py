@@ -11,12 +11,16 @@ What it does end to end, with NO external API:
   1. builds a BM25 index over the item chunks
   2. retrieves for a query, optionally PRE-FILTERED to a profession's groups
   3. assembles the guardrailed answer template from the retrieved item's real fields
-  4. build_llm_messages() shows exactly what you'd send to a model (the only missing
-     piece is the API call itself — seam marked below)
-  5. evaluate() runs a small grounded eval set and reports retrieval recall@k
+  4. build_llm_messages() shows exactly what you'd send to a model
+  5. call_llm() generates via OpenRouter (OpenAI-compatible); answer() orchestrates
+     retrieval + generation and falls back to the grounded template with no key
+  6. evaluate() runs a small grounded eval set and reports retrieval recall@k
 
-Swap for production: replace BM25 with vector embeddings (same retrieve() interface),
-and wire call_llm() to the Anthropic API.
+Generation: set OPENROUTER_API_KEY to enable the LLM. Model defaults to a free
+open-source model (DEFAULT_MODEL) and is overridable via OPENROUTER_MODEL. With no
+key, everything still runs — answer() returns the grounded, no-LLM template.
+
+Swap for production: replace BM25 with vector embeddings (same retrieve() interface).
 """
 
 import json
@@ -24,9 +28,24 @@ import os
 import re
 from rank_bm25 import BM25Okapi
 from mbs_professions import groups_for_profession, professions_for_item
+from mbs_query_rules import (RULES, active_rules, modality, is_collateral,
+                             is_group, is_initial_item, is_subsequent_item,
+                             INITIAL_ELIGIBLE_ITEMS)
 
 CHUNKS = "mbs_chunks.jsonl"
 SCHEDULE_VERSION = "2026-07-01"
+
+# OpenRouter (OpenAI-compatible) generation config.
+# Model is overridable via OPENROUTER_MODEL so it can change without a code edit.
+# Default is a cheap paid model that's reliably available; the free open-source
+# option (meta-llama/llama-3.3-70b-instruct:free) works too but is frequently
+# rate-limited upstream, so it isn't the default.
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+DEFAULT_MODEL = "openai/gpt-4o-mini"
+
+# Local semantic-embedding retrieval (fastembed / ONNX, offline after first run).
+EMBED_MODEL = "BAAI/bge-small-en-v1.5"
+EMBED_CACHE = "mbs_embeddings.npy"
 
 SYSTEM_PROMPT = (
     "You are an assistant that helps Australian health practitioners find and understand "
@@ -36,39 +55,88 @@ SYSTEM_PROMPT = (
     "what the descriptor says; route interpretation and eligibility questions to AskMBS / "
     "Services Australia (13 21 50). Give general information, not patient-specific billing "
     "advice. This is not billing or legal advice, and the Health Insurance Act 1973 is the "
-    "legal source."
+    "legal source. When several retrieved items could apply, present them side by side with "
+    "the conditions that distinguish them (duration, new vs existing patient, patient age "
+    "limits, location, referral requirements) rather than asserting a single item."
 )
 
 _word = re.compile(r"[a-z0-9]+")
 def tokenize(s): return _word.findall((s or "").lower())
 
 
-def modality(descriptor):
-    d = (descriptor or "").lower()
-    if d.startswith("video"):
-        return "video"
-    if d.startswith("phone"):
-        return "phone"
-    return "in_person"
+# Query-understanding rules (telehealth / collateral / initial / review / group)
+# and the item-property detectors (modality, is_collateral, ...) live in the
+# curated, auditable mbs_query_rules module and are imported at the top.
+
+_DUR = re.compile(r"(at least|more than|not more than|less than)\s+(\d+)\s+minutes")
 
 
-_TELEHEALTH_CUE = re.compile(r"video|phone|telehealth|telephone|remote")
+def item_conditions(r):
+    """Extract the high-signal conditions that distinguish similar items, for a
+    compact one-line summary in the grounded (no-LLM) answer."""
+    d = " ".join((r.get("descriptor") or "").split())
+    dl = d.lower()
+    bits = []
+    durs = _DUR.findall(dl)
+    if durs:
+        bits.append(" / ".join(f"{phrase} {n} min" for phrase, n in durs[:2]))
+    if "new patient" in dl:
+        bits.append("new patient / initial")
+    elif str(r.get("item_num")) in INITIAL_ELIGIBLE_ITEMS:
+        bits.append("initial — special one-off (see note)")
+    if is_group(r.get("descriptor")):
+        bits.append("group therapy")
+    age = re.search(r"aged under (\d+)|under (\d+) years|aged (\d+) years or", dl)
+    if age:
+        n = next(g for g in age.groups() if g)
+        bits.append(f"age ~{n}")
+    if "consulting rooms" in dl and "hospital" in dl:
+        bits.append("rooms/hospital")
+    elif "hospital" in dl:
+        bits.append("hospital")
+    elif "consulting rooms" in dl:
+        bits.append("consulting rooms")
+    mod = modality(r.get("descriptor"))
+    if mod != "in_person":
+        bits.append(mod)
+    if is_collateral(r.get("descriptor")):
+        bits.append("collateral (non-patient)")
+    if "following referral" in dl or "after referral" in dl or "referred" in dl:
+        bits.append("referral req'd")
+    return " · ".join(bits)
 
 
-class MBSRetriever:
+class BaseRetriever:
+    """Shared record loading, profession scoping, and modality preference.
+
+    Subclasses implement _scores(query) -> per-record relevance array and
+    _keep(score) -> whether a scored record clears the relevance floor. The
+    retrieve(query, profession, k) contract is identical across backends so
+    they are drop-in interchangeable.
+    """
+
     def __init__(self, path=CHUNKS):
         self.recs = [json.loads(l) for l in open(path, encoding="utf-8")]
-        corpus = [tokenize(r["chunk_text"]) for r in self.recs]
-        self.bm25 = BM25Okapi(corpus)
         # precompute per-item authoritative professions + modality
         self.item_profs = [
             set(professions_for_item(r["category"], r["group"], r["descriptor"]))
             for r in self.recs
         ]
         self.modality = [modality(r["descriptor"]) for r in self.recs]
+        # Precompute each curated rule's item mask once, for fast query-time scoring.
+        self._rule_masks = {
+            rule["name"]: [rule["item_test"](r) for r in self.recs]
+            for rule in RULES
+        }
+
+    def _scores(self, query):
+        raise NotImplementedError
+
+    def _keep(self, score):
+        return True
 
     def retrieve(self, query, profession=None, k=5):
-        scores = self.bm25.get_scores(tokenize(query))
+        scores = self._scores(query)
         # per-item profession filter (correctly handles mixed groups like A40/M18)
         if profession:
             candidate_idx = [i for i in range(len(self.recs))
@@ -77,38 +145,192 @@ class MBSRetriever:
                 candidate_idx = list(range(len(self.recs)))
         else:
             candidate_idx = list(range(len(self.recs)))
-        # prefer in-person unless the query asks for telehealth
-        want_tele = bool(_TELEHEALTH_CUE.search(query.lower()))
+        # Apply the curated query-understanding rules: each rule multiplies an
+        # item's score depending on whether its cue fired on this query.
+        active = active_rules(query)
         def adj(i):
             s = scores[i]
-            if not want_tele and self.modality[i] != "in_person":
-                s *= 0.6
+            for rule in RULES:
+                if self._rule_masks[rule["name"]][i]:
+                    s *= rule["active"] if active[rule["name"]] else rule["inactive"]
             return s
         ranked = sorted(candidate_idx, key=adj, reverse=True)
-        return [self.recs[i] for i in ranked[:k] if scores[i] > 0]
+        return [self.recs[i] for i in ranked[:k] if self._keep(scores[i])]
 
 
-def assemble_answer(retrieved, profession=None):
-    """Grounded answer-template output built from retrieved fields (no model needed)."""
+class BM25Retriever(BaseRetriever):
+    """Lexical BM25 retrieval. Fast, no dependencies beyond rank-bm25, but
+    keyword-only: it can surface lexically similar yet clinically wrong items."""
+
+    def __init__(self, path=CHUNKS):
+        super().__init__(path)
+        corpus = [tokenize(r["chunk_text"]) for r in self.recs]
+        self.bm25 = BM25Okapi(corpus)
+
+    def _scores(self, query):
+        return self.bm25.get_scores(tokenize(query))
+
+    def _keep(self, score):
+        return score > 0
+
+
+# Backward-compatible alias: existing callers get BM25 by default.
+MBSRetriever = BM25Retriever
+
+
+class EmbeddingRetriever(BaseRetriever):
+    """Semantic retrieval via local sentence embeddings (fastembed / ONNX).
+
+    Runs fully offline after the first model download — no API key, no per-query
+    cost. Document embeddings are cached to disk (keyed to model + schedule
+    version + record count) so startup is instant on subsequent runs.
+    """
+
+    def __init__(self, path=CHUNKS, model=EMBED_MODEL, cache=EMBED_CACHE, min_score=0.30):
+        super().__init__(path)
+        import numpy as np
+        from fastembed import TextEmbedding
+        self.np = np
+        self.min_score = min_score
+        self.embedder = TextEmbedding(model)
+        self.doc_emb = self._load_or_build(model, cache)
+
+    def _doc_text(self, r):
+        # Embed the group path + descriptor; the descriptor carries the clinical
+        # meaning that lexical matching misses. Truncate the long procedural tail
+        # of some descriptors — the distinguishing clinical terms are up front, and
+        # it keeps the one-time build fast.
+        desc = ' '.join(r['descriptor'].split())[:512]
+        return f"{r['category_title']} {r['group']}: {desc}"
+
+    def _embed_norm(self, texts):
+        np = self.np
+        emb = np.asarray(list(self.embedder.embed(list(texts))), dtype="float32")
+        # Sanitise: drop any non-finite values, then L2-normalise with a safe
+        # divisor so all-zero / degenerate embeddings don't produce nan/inf.
+        emb = np.nan_to_num(emb, nan=0.0, posinf=0.0, neginf=0.0)
+        norms = np.linalg.norm(emb, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        return emb / norms
+
+    def _load_or_build(self, model, cache):
+        np = self.np
+        # 'v2' invalidates any cache built with the earlier normalisation bug.
+        sig = f"v2|{model}|{self.recs[0]['schedule_version']}|{len(self.recs)}"
+        meta = cache + ".meta"
+        if os.path.exists(cache) and os.path.exists(meta) and open(meta).read() == sig:
+            return np.load(cache)
+        emb = self._embed_norm(self._doc_text(r) for r in self.recs)
+        np.save(cache, emb)
+        with open(meta, "w") as f:
+            f.write(sig)
+        return emb
+
+    def _scores(self, query):
+        np = self.np
+        q = self._embed_norm([query])[0]
+        # numpy's float32 matmul can raise spurious FP-state warnings on some
+        # BLAS backends (e.g. macOS Accelerate); guard it and sanitise output so
+        # any degenerate row sorts to the bottom rather than as nan.
+        with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+            scores = self.doc_emb @ q     # cosine similarity (both L2-normalised)
+        return np.nan_to_num(scores, nan=-1.0, posinf=-1.0, neginf=-1.0)
+
+    def _keep(self, score):
+        return score >= self.min_score
+
+
+def make_retriever(kind=None, path=CHUNKS):
+    """Choose a retriever. Defaults to embeddings (better precision); set
+    MBS_RETRIEVER=bm25 to force lexical, or falls back to BM25 automatically if
+    the embedding backend isn't installed."""
+    kind = kind or os.environ.get("MBS_RETRIEVER", "embedding")
+    if kind == "bm25":
+        return BM25Retriever(path)
+    try:
+        return EmbeddingRetriever(path)
+    except Exception as e:
+        print(f"  [warn] embedding retriever unavailable ({type(e).__name__}: {e}); "
+              "using BM25")
+        return BM25Retriever(path)
+
+
+def assemble_answer(retrieved, profession=None, max_items=4):
+    """Grounded, multi-item answer built from retrieved fields (no model needed).
+
+    Presents up to max_items candidates side by side with the conditions that
+    distinguish them, so an ambiguous query returns a useful comparison rather
+    than one (possibly wrong) asserted item.
+    """
     if not retrieved:
         return ("I don't have an MBS item in the loaded schedule that matches that. "
                 "Please check MBS Online or contact AskMBS / Services Australia (13 21 50).")
-    top = retrieved[0]
+
+    items = retrieved[:max_items]
+    top = items[0]
     profs = professions_for_item(top["category"], top["group"], top["descriptor"])
+
     lines = [
-        f"Item(s): {top['item_num']} — {' '.join(top['descriptor'].split())[:160]}...",
-        f"{top['fee_display']}",
-        f"Who can claim: {', '.join(profs) if profs else 'see descriptor / notes'}",
-        f"Based on: {top['schedule_version']} schedule"
-        f" (effective {top['description_start_date'] or top['item_start_date']})",
-        f"Source: {top['source_url']}",
-        "Note: General information only, not billing advice. For binding interpretation "
-        "or eligibility, contact AskMBS or Services Australia (13 21 50).",
+        f"Possible MBS items (schedule {top['schedule_version']}). More than one may "
+        "apply — check the distinguishing conditions against your situation:",
+        "",
     ]
-    others = [r["item_num"] for r in retrieved[1:]]
-    if others:
-        lines.append(f"Related items retrieved: {', '.join(others)}")
+    for r in items:
+        cond = item_conditions(r)
+        head = f"• Item {r['item_num']} ({r['category_title']} > {r['group']})"
+        if cond:
+            head += f" — {cond}"
+        lines.append(head)
+        lines.append(f"    {' '.join(r['descriptor'].split())[:200]}...")
+        lines.append(f"    {r['fee_display']}   Source: {r['source_url']}")
+        prim = (r.get("notes") or {}).get("primary", [])
+        if prim:
+            lines.append("    Applicable note(s): "
+                         + "; ".join(f"{p['note_id']} {p['title'][:50]}" for p in prim))
+    lines += [
+        "",
+        f"Who can claim (item {top['item_num']}): "
+        f"{', '.join(profs) if profs else 'see descriptor / notes'}.",
+        "General information only, not billing advice. Eligibility and binding "
+        "interpretation: AskMBS or Services Australia (13 21 50). Legal source: "
+        "Health Insurance Act 1973.",
+    ]
     return "\n".join(lines)
+
+
+_NOTES_INDEX = None
+
+
+def load_notes_index(path="mbs_notes.jsonl"):
+    """Lazy-load {note_id: note_record} from the extracted notes file, if present."""
+    global _NOTES_INDEX
+    if _NOTES_INDEX is None:
+        _NOTES_INDEX = {}
+        if os.path.exists(path):
+            for line in open(path, encoding="utf-8"):
+                n = json.loads(line)
+                _NOTES_INDEX[n["note_id"]] = n
+    return _NOTES_INDEX
+
+
+def primary_notes_for(retrieved, max_notes=4, body_chars=700):
+    """Deduped explanatory notes for the retrieved items, most-specific first
+    (item-title 'primary' notes, then group-level notes): [(id, title, excerpt)]."""
+    idx = load_notes_index()
+    seen, out = set(), []
+    for kind in ("primary", "group"):
+        for r in retrieved:
+            for ref in (r.get("notes") or {}).get(kind, []):
+                nid = ref["note_id"]
+                if nid in seen:
+                    continue
+                seen.add(nid)
+                n = idx.get(nid)
+                if n:
+                    out.append((nid, ref["title"], " ".join(n["body"].split())[:body_chars]))
+                if len(out) >= max_notes:
+                    return out
+    return out
 
 
 def build_llm_messages(query, retrieved):
@@ -119,18 +341,122 @@ def build_llm_messages(query, retrieved):
         f"Source: {r['source_url']}"
         for r in retrieved
     )
-    user = (f"Question: {query}\n\nRetrieved MBS items:\n{context}\n\n"
-            "Answer using only these items, following the citation rules.")
+    notes = primary_notes_for(retrieved)
+    notes_block = ""
+    if notes:
+        notes_block = "\n\nApplicable explanatory notes (use for context only):\n" + \
+            "\n\n".join(f"[{nid}] {title}\n{body}" for nid, title, body in notes)
+    user = (
+        f"Question: {query}\n\nCandidate MBS items:\n{context}{notes_block}\n\n"
+        "Using ONLY the items and notes above:\n"
+        "- If several plausibly apply, list each with the conditions that distinguish it "
+        "(duration, new vs existing patient, patient age limits, location — consulting "
+        "rooms / hospital / telehealth, referral requirements) so the practitioner can "
+        "identify the right one.\n"
+        "- Where an explanatory note clarifies how an item is intended to be used "
+        "(e.g. a one-off assessment, or that it can be combined with other items), "
+        "reflect that and cite the note ID.\n"
+        "- Do not declare a single item definitive when others could also apply.\n"
+        "- Cite item number, schedule version and source link for each item you mention.\n"
+        "- If none clearly fit, say so and point to AskMBS.\n"
+        "- Route eligibility and binding interpretation to AskMBS / Services Australia "
+        "(13 21 50). General information only, not billing advice."
+    )
     return [{"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user}]
 
 
-def call_llm(messages):
-    """SEAM: drop in the Anthropic API here for production generation.
-    Left unimplemented so the prototype runs without a key."""
-    raise NotImplementedError(
-        "Wire to the Anthropic API. assemble_answer() gives a grounded, no-LLM answer "
-        "in the meantime.")
+def call_llm(messages, model=None, temperature=0.0, timeout=60, retries=3):
+    """Generate an answer via OpenRouter's OpenAI-compatible chat completions API.
+
+    Uses only the standard library (no extra dependency) so the seam stays light.
+    Requires OPENROUTER_API_KEY in the environment. The model defaults to
+    DEFAULT_MODEL and can be overridden per-call or via OPENROUTER_MODEL.
+
+    Retries on 429 / 5xx (common on free-tier models when a provider is
+    congested), honouring the Retry-After header when present. Raises
+    RuntimeError on a missing key or a persistent non-2xx response so callers
+    can fall back to assemble_answer().
+    """
+    import time
+    import urllib.request
+    import urllib.error
+
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENROUTER_API_KEY is not set.")
+
+    model = model or os.environ.get("OPENROUTER_MODEL", DEFAULT_MODEL)
+    body = json.dumps({
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        OPENROUTER_URL,
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            # Optional but recommended by OpenRouter for attribution/ranking.
+            "HTTP-Referer": os.environ.get("OPENROUTER_REFERER", "https://mbsaiassistant.local"),
+            "X-Title": "MBS AI Assistant",
+        },
+    )
+
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            try:
+                return data["choices"][0]["message"]["content"].strip()
+            except (KeyError, IndexError):
+                raise RuntimeError(f"Unexpected OpenRouter response shape: {str(data)[:500]}")
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", "replace")[:500]
+            last_err = RuntimeError(f"OpenRouter HTTP {e.code}: {detail}")
+            transient = e.code == 429 or 500 <= e.code < 600
+            if not transient or attempt == retries:
+                raise last_err
+            wait = float(e.headers.get("Retry-After") or 0) or (2 ** attempt)
+            print(f"  [retry] {e.code} from OpenRouter, waiting {wait:.0f}s "
+                  f"(attempt {attempt + 1}/{retries})")
+            time.sleep(wait)
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"OpenRouter request failed: {e.reason}")
+    raise last_err
+
+
+def answer(query, retriever, profession=None, k=5, use_llm=None):
+    """End-to-end: retrieve, then generate. Returns (text, retrieved_items).
+
+    use_llm:
+      None  -> auto: use OpenRouter iff OPENROUTER_API_KEY is set, else the
+               grounded no-LLM template.
+      True  -> force the LLM (raises if no key / call fails).
+      False -> always use assemble_answer() (no network).
+
+    On any LLM error in auto mode, falls back to the grounded template so the
+    tool degrades gracefully rather than erroring out on the practitioner.
+    """
+    forced = use_llm is True           # caller explicitly demanded the LLM
+    retrieved = retriever.retrieve(query, profession, k)
+    if use_llm is None:
+        use_llm = bool(os.environ.get("OPENROUTER_API_KEY"))
+    if not use_llm or not retrieved:
+        return assemble_answer(retrieved, profession), retrieved
+
+    messages = build_llm_messages(query, retrieved)
+    try:
+        return call_llm(messages), retrieved
+    except RuntimeError as e:
+        if forced:                     # no silent fallback when explicitly forced
+            raise
+        print(f"  [warn] LLM call failed, using grounded template: {e}")
+        return assemble_answer(retrieved, profession), retrieved
 
 
 # --- evaluation ----------------------------------------------------------------
@@ -166,11 +492,32 @@ def evaluate(retriever, k=5):
     print(f"\n  Score: {hits}/{len(EVAL_SET)} queries surfaced a correct in-person item.")
 
 
+def load_dotenv(path=".env"):
+    """Minimal .env loader (no dependency). Existing env vars win over the file."""
+    if not os.path.exists(path):
+        return
+    for line in open(path, encoding="utf-8"):
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key, val = key.strip(), val.strip().strip('"').strip("'")
+        os.environ.setdefault(key, val)
+
+
 def main():
+    load_dotenv(".env.local")   # local overrides load first (setdefault keeps them)
+    load_dotenv(".env")
     if not os.path.exists(CHUNKS):
         print("Run mbs_parser.py first to produce", CHUNKS); return
-    r = MBSRetriever()
-    print(f"Indexed {len(r.recs)} items ({SCHEDULE_VERSION}).")
+    r = make_retriever()
+    print(f"Indexed {len(r.recs)} items ({SCHEDULE_VERSION}) "
+          f"via {type(r).__name__}.")
+
+    llm_on = bool(os.environ.get("OPENROUTER_API_KEY"))
+    mode = (f"OpenRouter ({os.environ.get('OPENROUTER_MODEL', DEFAULT_MODEL)})"
+            if llm_on else "grounded template (no OPENROUTER_API_KEY set)")
+    print(f"Generation mode: {mode}")
 
     demos = [
         ("individual therapy session for my patient", "clinical_psychologist"),
@@ -180,9 +527,9 @@ def main():
     for q, prof in demos:
         print("\n" + "=" * 78)
         print(f"Q: {q!r}   (as: {prof})")
-        hits = r.retrieve(q, prof, k=4)
+        text, _ = answer(q, r, profession=prof, k=4)
         print("-" * 78)
-        print(assemble_answer(hits, prof))
+        print(text)
 
     evaluate(r, k=5)
 

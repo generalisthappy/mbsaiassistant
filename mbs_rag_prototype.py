@@ -119,7 +119,7 @@ class BaseRetriever:
         self.recs = [json.loads(l) for l in open(path, encoding="utf-8")]
         # precompute per-item authoritative professions + modality
         self.item_profs = [
-            set(professions_for_item(r["category"], r["group"], r["descriptor"]))
+            set(professions_for_item(r["category"], r["group"], r["descriptor"], r.get("subgroup")))
             for r in self.recs
         ]
         self.modality = [modality(r["descriptor"]) for r in self.recs]
@@ -268,7 +268,7 @@ def assemble_answer(retrieved, profession=None, max_items=4):
 
     items = retrieved[:max_items]
     top = items[0]
-    profs = professions_for_item(top["category"], top["group"], top["descriptor"])
+    profs = professions_for_item(top["category"], top["group"], top["descriptor"], top.get("subgroup"))
 
     lines = [
         f"Possible MBS items (schedule {top['schedule_version']}). More than one may "

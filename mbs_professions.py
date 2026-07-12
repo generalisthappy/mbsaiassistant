@@ -61,11 +61,34 @@ def _refine_from_descriptor(descriptor, allowed):
     return [p for p in found if p in allowed]
 
 
-def professions_for_item(category, group, descriptor=""):
-    """Authoritative professions for an item. Group-driven; refined for mixed groups."""
+def _in_scope(scope, subgroup, descriptor):
+    """True if an item belongs in a scoped group's mental-health subset.
+
+    Hybrid test: passes if the item's subgroup is whitelisted OR its descriptor matches
+    the include regex. Subgroups anchor the structurally-clean slice (e.g. psychiatry
+    telehealth); the regex catches items interleaved in general subgroups (e.g. GP
+    mental-health telehealth)."""
+    subs = scope.get("subgroups")
+    if subs and subgroup is not None and str(subgroup) in set(subs):
+        return True
+    inc = scope.get("descriptor_include")
+    if inc and re.search(inc, (descriptor or "").lower()):
+        return True
+    return False
+
+
+def professions_for_item(category, group, descriptor="", subgroup=None):
+    """Authoritative professions for an item. Group-driven; refined for mixed groups.
+
+    A group may carry a "scope" block (e.g. A40, the general telehealth group) that
+    restricts which of its items belong in the mental-health map, by subgroup whitelist
+    and/or a descriptor regex. Items outside the scope return [] (not in the MH map)."""
     g = _IDX.get((category, group))
     if not g:
         return []              # group not in the mental-health map
+    scope = g.get("scope")
+    if scope and not _in_scope(scope, subgroup, descriptor):
+        return []              # in the group, but outside its MH-relevant scope
     if not g.get("mixed"):
         return list(g["professions"])
     refined = _refine_from_descriptor(descriptor, set(g["professions"]))
@@ -90,7 +113,7 @@ if __name__ == "__main__":
     c = Counter()
     mixed_examples = []
     for r in recs:
-        profs = professions_for_item(r["category"], r["group"], r["descriptor"])
+        profs = professions_for_item(r["category"], r["group"], r["descriptor"], r.get("subgroup"))
         r["professions"] = profs
         for p in profs:
             c[p] += 1

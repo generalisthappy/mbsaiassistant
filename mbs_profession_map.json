@@ -20,7 +20,12 @@
     {
       "cat": "1", "grp": "A40", "mixed": true,
       "professions": ["general_practitioner", "psychiatrist", "consultant_physician", "specialist", "nurse_practitioner"],
-      "label": "Telehealth (video/phone) attendances - mixed medical providers"
+      "scope": {
+        "_note": "A40 is the GENERAL telehealth group (all specialties). Restrict it to mental-health telehealth: psychiatry items (subgroup whitelist, structurally clean) OR GP/medical mental-health items (descriptor, interleaved in general subgroups). Items outside this scope are excluded from the MH map.",
+        "subgroups": ["5", "6", "8", "9", "25", "26"],
+        "descriptor_include": "mental health|mental disorder|psychological|psychiatr"
+      },
+      "label": "Telehealth mental-health attendances (scoped MH subset of general telehealth Group A40)"
     },
     {
       "cat": "8", "grp": "M6", "mixed": false,

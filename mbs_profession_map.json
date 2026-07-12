@@ -19,7 +19,7 @@
     },
     {
       "cat": "1", "grp": "A40", "mixed": true,
-      "professions": ["general_practitioner", "psychiatrist", "consultant_physician", "specialist"],
+      "professions": ["general_practitioner", "psychiatrist", "consultant_physician", "specialist", "nurse_practitioner"],
       "label": "Telehealth (video/phone) attendances - mixed medical providers"
     },
     {
@@ -39,7 +39,7 @@
     },
     {
       "cat": "8", "grp": "M18", "mixed": true,
-      "professions": ["clinical_psychologist", "registered_psychologist", "dietitian", "fps_allied_health"],
+      "professions": ["clinical_psychologist", "registered_psychologist", "dietitian", "fps_allied_health", "nurse_practitioner", "consultant_physician", "mental_health_nurse"],
       "label": "Telehealth (video/phone) allied mental health & eating disorder services"
     }
   ]

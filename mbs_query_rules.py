@@ -149,10 +149,12 @@ RULES = [
         "name": "initial_curated_special",
         "query_cue": _INITIAL_CUE,
         "item_test": is_curated_initial,
-        "active": 1.2, "inactive": 1.0,
+        "active": 1.5, "inactive": 1.0,
         "rationale": "Items initial-eligible only via an explanatory note (special "
-                     "one-off cases like 291 per AN.0.30) get a modest boost — enough "
-                     "to surface, but not to outrank the standard new-patient items.",
+                     "one-off cases like 291 per AN.0.30) get a boost — enough to surface "
+                     "into the top results (above demoted telehealth/other items) but not "
+                     "to outrank the standard face-to-face new-patient items (296/297/299). "
+                     "Calibrated 2026-07-12 so 291 enters top-5 under semantic retrieval.",
         "mbs_note": "AN.0.30",
     },
     {

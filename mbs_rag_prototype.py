@@ -47,6 +47,15 @@ DEFAULT_MODEL = "openai/gpt-4o-mini"
 # Local semantic-embedding retrieval (fastembed / ONNX, offline after first run).
 EMBED_MODEL = "BAAI/bge-small-en-v1.5"
 EMBED_CACHE = "mbs_embeddings.npy"
+# Relevance floor for semantic retrieval: below this cosine score an item is treated
+# as "no real match" and dropped, so a genuinely out-of-scope query returns nothing and
+# the answer routes to AskMBS instead of asserting wrong items. Calibrated 2026-07-12
+# against the eval: clearly out-of-scope queries (chest x-ray, colonoscopy, hip
+# replacement) top out at ~0.51-0.55 cosine, while real in-scope queries score >=0.68,
+# so 0.60 sits in the gap with margin both ways. Raise toward 0.62 to also reject
+# naturally-phrased out-of-scope questions ("bulk billing rules for a colonoscopy"), at a
+# slightly higher risk of refusing very vaguely-worded legitimate queries.
+EMBED_MIN_SCORE = 0.60
 
 SYSTEM_PROMPT = (
     "You are an assistant that helps Australian health practitioners find and understand "
@@ -187,7 +196,7 @@ class EmbeddingRetriever(BaseRetriever):
     version + record count) so startup is instant on subsequent runs.
     """
 
-    def __init__(self, path=CHUNKS, model=EMBED_MODEL, cache=EMBED_CACHE, min_score=0.30):
+    def __init__(self, path=CHUNKS, model=EMBED_MODEL, cache=EMBED_CACHE, min_score=EMBED_MIN_SCORE):
         super().__init__(path)
         import numpy as np
         from fastembed import TextEmbedding

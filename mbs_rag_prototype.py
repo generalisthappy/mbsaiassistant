@@ -313,9 +313,37 @@ def load_notes_index(path="mbs_notes.jsonl"):
     return _NOTES_INDEX
 
 
+def _note_excerpt(body, item_num, body_chars=700):
+    """Return a body excerpt of at most ~body_chars. If the item number appears in the
+    body, centre the window on its first occurrence so the clause that actually governs
+    the item is included (many notes are long and mention the item deep in the text);
+    otherwise fall back to the head of the body."""
+    body = " ".join((body or "").split())
+    if len(body) <= body_chars:
+        return body
+    pos = -1
+    if item_num:
+        m = re.search(r"\b" + re.escape(str(item_num)) + r"\b", body)
+        if m:
+            pos = m.start()
+    if pos == -1:
+        return body[:body_chars].rstrip() + " …"
+    half = body_chars // 2
+    end = min(len(body), pos + half)
+    start = max(0, end - body_chars)
+    end = min(len(body), start + body_chars)
+    snip = body[start:end].strip()
+    if start > 0:
+        snip = "… " + snip
+    if end < len(body):
+        snip = snip + " …"
+    return snip
+
+
 def primary_notes_for(retrieved, max_notes=4, body_chars=700):
     """Deduped explanatory notes for the retrieved items, most-specific first
-    (item-title 'primary' notes, then group-level notes): [(id, title, excerpt)]."""
+    (item-title 'primary' notes, then group-level notes): [(id, title, excerpt)].
+    Each excerpt is centred on the surfacing item's number when present in the body."""
     idx = load_notes_index()
     seen, out = set(), []
     for kind in ("primary", "group"):
@@ -327,7 +355,8 @@ def primary_notes_for(retrieved, max_notes=4, body_chars=700):
                 seen.add(nid)
                 n = idx.get(nid)
                 if n:
-                    out.append((nid, ref["title"], " ".join(n["body"].split())[:body_chars]))
+                    out.append((nid, ref["title"],
+                                _note_excerpt(n["body"], r.get("item_num"), body_chars)))
                 if len(out) >= max_notes:
                     return out
     return out

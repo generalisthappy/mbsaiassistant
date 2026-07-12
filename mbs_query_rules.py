@@ -69,6 +69,12 @@ def is_group(descriptor):
     return bool(_GROUP.search((descriptor or "").lower()))
 
 
+def is_eating_disorder(descriptor):
+    """Eating-disorder-specific item (Group M16, GP ED plans A36, ED telehealth in
+    A40/M18). Descriptor-derived: these all name 'eating disorder'."""
+    return "eating disorder" in (descriptor or "").lower()
+
+
 def is_text_new_patient(r):
     """Standard new-patient item — the descriptor itself says 'new patient'."""
     return "new patient" in (r.get("descriptor") or "").lower()
@@ -104,6 +110,7 @@ _COLLATERAL_CUE = re.compile(r"collateral|family|carer|relative|parent|partner|f
 _INITIAL_CUE = re.compile(r"\b(initial|first|new patient|new referral|intake|new consult)\b")
 _REVIEW_CUE = re.compile(r"\b(review|subsequent|follow[- ]?up|ongoing|existing patient|continuing)\b")
 _GROUP_CUE = re.compile(r"\bgroup\b")
+_ED_CUE = re.compile(r"eating disorder|anorexia|bulimia|binge[- ]?eating")
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +171,18 @@ RULES = [
         "active": 1.5, "inactive": 0.5,
         "rationale": "Group-therapy items should surface only when the query mentions "
                      "a group; individual/standard queries should demote them.",
+        "mbs_note": None,
+    },
+    {
+        "name": "eating_disorder",
+        "query_cue": _ED_CUE,
+        "item_test": lambda r: is_eating_disorder(r.get("descriptor")),
+        "active": 1.2, "inactive": 0.4,
+        "rationale": "Eating-disorder items (Group M16, GP ED plans A36, ED telehealth in "
+                     "A40/M18) are specialised. A generic therapy query should not surface "
+                     "them ahead of the general therapy items (M6/M7); only boost when the "
+                     "query mentions an eating disorder. Fixes ED items crowding vague "
+                     "'individual therapy session' queries under semantic retrieval.",
         "mbs_note": None,
     },
 ]

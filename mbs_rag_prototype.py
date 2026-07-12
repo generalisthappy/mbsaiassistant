@@ -489,36 +489,79 @@ def answer(query, retriever, profession=None, k=5, use_llm=None):
 
 
 # --- evaluation ----------------------------------------------------------------
-# Grounded eval: a query passes if it surfaces a correct IN-PERSON item from the
-# expected (category, group) for that profession. Expected item sets are read from the
-# live index at run time, so the bar reflects the real schedule, not hardcoded numbers.
+# Typed eval. Expected item sets are read from the live index at run time, so the bar
+# reflects the real schedule, not hardcoded numbers. Case tuple: (type, query, profession, target).
+#   recall   -> an IN-PERSON item from target (cat, grp) surfaces in top-k
+#   modality -> a TELEHEALTH (video/phone) item from target (cat, grp) surfaces in top-k
+#   item     -> the specific target item number surfaces in top-k
+#   refuse   -> out of scope: the assistant routes/declines (retrieval clears to nothing)
+#   xfail    -> a KNOWN GAP (should route but currently does not); reported, not scored
 EVAL_SET = [
-    ("individual therapy session by a clinical psychologist", "clinical_psychologist", ("8", "M6")),
-    ("focussed psychological strategies by a psychologist", "registered_psychologist", ("8", "M7")),
-    ("psychiatrist attendance at least 45 minutes", "psychiatrist", ("1", "A8")),
-    ("GP mental health treatment plan 20 to 40 minutes", "general_practitioner", ("1", "A20")),
-    ("GP eating disorder treatment and management plan", "general_practitioner", ("1", "A36")),
-    ("dietitian service for an eating disorder", "dietitian", ("8", "M16")),
+    # -- positive recall, one per covered in-person group --
+    ("recall", "individual therapy session by a clinical psychologist", "clinical_psychologist", ("8", "M6")),
+    ("recall", "focussed psychological strategies by a psychologist", "registered_psychologist", ("8", "M7")),
+    ("recall", "focussed psychological strategies by an occupational therapist", "fps_allied_health", ("8", "M7")),
+    ("recall", "focussed psychological strategies by a social worker", "fps_allied_health", ("8", "M7")),
+    ("recall", "psychiatrist attendance at least 45 minutes", "psychiatrist", ("1", "A8")),
+    ("recall", "GP mental health treatment plan 20 to 40 minutes", "general_practitioner", ("1", "A20")),
+    ("recall", "GP mental health treatment consultation review", "general_practitioner", ("1", "A20")),
+    ("recall", "GP eating disorder treatment and management plan", "general_practitioner", ("1", "A36")),
+    ("recall", "dietitian service for an eating disorder", "dietitian", ("8", "M16")),
+    ("recall", "eating disorder psychological treatment by a clinical psychologist", "clinical_psychologist", ("8", "M16")),
+    # -- modality: telehealth queries should reach the video/phone groups --
+    ("modality", "psychiatrist telehealth video attendance", "psychiatrist", ("1", "A40")),
+    ("modality", "GP mental health service by telephone", "general_practitioner", ("1", "A40")),
+    ("modality", "clinical psychologist video telehealth therapy session", "clinical_psychologist", ("8", "M18")),
+    ("modality", "psychologist focussed psychological strategies by phone", "registered_psychologist", ("8", "M18")),
+    # -- specific curated item --
+    ("item", "initial psychiatric assessment more than 45 minutes new patient", "psychiatrist", "291"),
+    # -- refusals the pipeline handles: clinically out-of-scope, no lexical overlap --
+    ("refuse", "chest x-ray", "psychiatrist", None),
+    ("refuse", "colonoscopy", "general_practitioner", None),
+    ("refuse", "hip replacement surgery", "clinical_psychologist", None),
+    # -- known gaps (reported, not scored): should route to AskMBS but currently do not --
+    ("xfail", "can I claim item 80000 if the patient was not referred", "clinical_psychologist",
+     "eligibility question — should route to AskMBS, currently answers with the item"),
+    ("xfail", "how many psychology sessions is a patient entitled to in a year", "registered_psychologist",
+     "program-rule question — should route, currently retrieves items"),
+    ("xfail", "bulk billing rules for a colonoscopy", "general_practitioner",
+     "out-of-scope but naturally phrased — generic words (billing/rules) leak past BM25, so it "
+     "returns items instead of routing; a relevance floor on generic vocab would close this"),
 ]
+
+_TAG = {"recall": "RECALL", "modality": "MODAL", "item": "ITEM", "refuse": "REFUSE", "xfail": "XFAIL"}
 
 
 def evaluate(retriever, k=5):
-    # build expected in-person item sets per group from the index
-    expected_by_group = {}
+    inperson, telehealth = {}, {}
     for i, r in enumerate(retriever.recs):
-        if retriever.modality[i] == "in_person":
-            expected_by_group.setdefault((r["category"], r["group"]), set()).add(r["item_num"])
+        key = (r["category"], r["group"])
+        bucket = inperson if retriever.modality[i] == "in_person" else telehealth
+        bucket.setdefault(key, set()).add(r["item_num"])
 
-    hits = 0
-    print(f"\nEVAL (recall@{k}, profession-filtered, in-person target):")
-    for query, profession, group in EVAL_SET:
-        expected = expected_by_group.get(group, set())
-        got = {r["item_num"] for r in retriever.retrieve(query, profession, k)}
-        ok = bool(got & expected)
-        hits += ok
-        print(f"  [{'PASS' if ok else 'FAIL'}] {query!r}  (target {group[1]})")
-        print(f"         got {sorted(got)}")
-    print(f"\n  Score: {hits}/{len(EVAL_SET)} queries surfaced a correct in-person item.")
+    def got_for(q, prof):
+        return {r["item_num"] for r in retriever.retrieve(q, prof, k)}
+
+    scored = graded = 0
+    print(f"\nEVAL (typed, recall@{k}):")
+    for typ, q, prof, target in EVAL_SET:
+        if typ == "recall":
+            got = got_for(q, prof); ok = bool(got & inperson.get(target, set()))
+        elif typ == "modality":
+            got = got_for(q, prof); ok = bool(got & telehealth.get(target, set()))
+        elif typ == "item":
+            got = got_for(q, prof); ok = target in got
+        elif typ == "refuse":
+            got = got_for(q, prof); ok = not got            # nothing clears the floor -> assistant routes
+        elif typ == "xfail":
+            got = got_for(q, prof); routed = not got
+            mark = "ROUTES" if routed else "known-gap"
+            print(f"  [{mark:9s}] {_TAG[typ]:6s} {q!r}")
+            continue
+        scored += 1; graded += ok
+        print(f"  [{'PASS' if ok else 'FAIL':9s}] {_TAG[typ]:6s} {q!r}")
+    print(f"\n  Score: {graded}/{scored} scored cases passed "
+          f"({sum(1 for c in EVAL_SET if c[0]=='xfail')} known-gap cases reported separately).")
 
 
 def load_dotenv(path=".env"):

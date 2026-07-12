@@ -1,0 +1,14 @@
+{
+  "_note": "Providers that appear in mental-health care but do NOT bill MBS items in their own right. Used to give an explicit, grounded answer rather than silently returning nothing. NOT authoritative — verify funding arrangements before production use. Keep aliases lowercase.",
+  "schedule_version": "2026-07-01",
+  "providers": [
+    {
+      "id": "mental_health_nurse",
+      "aliases": ["mental health nurse", "credentialed mental health nurse", "mental health nurses", "mhn", "cmhn"],
+      "billable": false,
+      "summary": "Credentialed mental health nurses do not have MBS item numbers they can claim in their own right.",
+      "funding": "Their services are funded through Primary Health Network (PHN) commissioned programs — the former Mental Health Nurse Incentive Program (MHNIP), folded into PHN commissioning in 2016 — not fee-for-service MBS.",
+      "note": "A mental health nurse may deliver care under an MBS-billing provider (e.g. a GP or psychiatrist), but the MBS claim is made by that provider, not the nurse."
+    }
+  ]
+}

@@ -28,6 +28,7 @@ import os
 import re
 from rank_bm25 import BM25Okapi
 from mbs_professions import groups_for_profession, professions_for_item
+from mbs_not_billable import not_billable_hit, explain
 from mbs_query_rules import (RULES, active_rules, modality, is_collateral,
                              is_group, is_initial_item, is_subsequent_item,
                              INITIAL_ELIGIBLE_ITEMS)
@@ -472,6 +473,9 @@ def answer(query, retriever, profession=None, k=5, use_llm=None):
     tool degrades gracefully rather than erroring out on the practitioner.
     """
     forced = use_llm is True           # caller explicitly demanded the LLM
+    nb = not_billable_hit(query)                      # not-billable provider?
+    if nb:                                            # explicit answer, skip retrieval
+        return explain(nb), []
     retrieved = retriever.retrieve(query, profession, k)
     if use_llm is None:
         use_llm = bool(os.environ.get("OPENROUTER_API_KEY"))

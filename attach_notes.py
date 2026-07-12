@@ -30,8 +30,10 @@ from collections import defaultdict
 # The letter maps to a category; ".0." notes are category-general (not group-
 # specific) and reach items via their explicit item references instead.
 _NOTE_ID = re.compile(r"^([A-Z])N\.(\d+)\.\d+$")
-_CAT_OF_LETTER = {"A": "1", "M": "8", "T": "3", "P": "5", "D": "2",
-                  "O": "6", "I": "4", "C": "7"}
+# Letter -> category, derived from the real schedule group codes:
+# cat 4 uses O-groups, cat 5 uses I-groups, cat 6 uses P-groups (verified against the data).
+_CAT_OF_LETTER = {"A": "1", "D": "2", "T": "3", "O": "4", "I": "5",
+                  "P": "6", "C": "7", "M": "8"}
 
 
 def note_governs_group(note_id):

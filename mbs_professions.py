@@ -28,7 +28,6 @@ _REFINE = [
     ("dietitian", r"dietitian"),
     ("fps_allied_health", r"occupational therap|social worker"),
     ("nurse_practitioner", r"nurse practitioner"),
-    ("mental_health_nurse", r"mental health nurse"),
 ]
 
 

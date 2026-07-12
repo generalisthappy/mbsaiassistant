@@ -44,7 +44,7 @@
     },
     {
       "cat": "8", "grp": "M18", "mixed": true,
-      "professions": ["clinical_psychologist", "registered_psychologist", "dietitian", "fps_allied_health", "nurse_practitioner", "consultant_physician", "mental_health_nurse"],
+      "professions": ["clinical_psychologist", "registered_psychologist", "dietitian", "fps_allied_health", "nurse_practitioner", "consultant_physician"],
       "label": "Telehealth (video/phone) allied mental health & eating disorder services"
     }
   ]
